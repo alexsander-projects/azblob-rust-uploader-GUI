@@ -1,24 +1,34 @@
-# Rust-azure-storage-uploader
+# Rust-azure-storage-uploader-Druid
 
-## Blazingly fast azure-storage uploader in Rust
+## Blazing fast Azure Storage Blob uploader for Rust with GUI
 
-- The app is able to upload files of any size. It uses the Azure Storage SDK for Rust to upload the files to the Azure
-  Storage account.
-- The app is able to upload files in parallel.
+![](resources/appUI.png)
 
-### How to run
+- You can upload files to Azure Storage Blob with this app.
+- You can upload multiple files at once.
 
-- First, set the environment variables `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_ACCESS_KEY` with the credentials of your
-  Azure Storage account.
-- Then, run the app specifying the container name, the folder path, and the upload folder name.
+## How to use
 
-```bash
-cargo run --release -- <container> <folder_path> <upload_folder>
-```
+The intention of this app is to upload files to Azure Storage Account. This files being inside a folder in the local machine.
+The app then creates a folder in the container and uploads the files to that folder.
 
-### Parameters
+- You need to have Azure Storage Account and get the Access key.
+- You need to create a container in Azure Storage Account.
+- You need to provide the container name and access key in the app.
+- Provide the file path as well. Eg: `C:\Users\user\files\`
+- Provide the name of the folder to be created in the container.
+- You can upload files by clicking the "Upload" button.
 
-- container: The name of the container where the files will be uploaded.
-- folder_path: The path to the folder that contains the files that will be uploaded.
-- upload_folder: The name of the folder that will be created in the container to store the files.
+## How it works
 
+- The app uses the `azure-storage-blob` crate to upload files to Azure Storage Blob.
+- The app uses the `druid` crate to create the GUI.
+- The app uses the `tokio` crate to run the async functions.
+
+The app's performance is very good. It can upload multiple files at once while using minimal cpu.
+
+Due to the logic of the upload, it may use more memory when uploading large files.
+
+## How to run
+
+Simply run the `.exe` file in the `target\release` folder. The app is already compiled for Windows.
