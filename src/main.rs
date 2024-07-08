@@ -214,9 +214,9 @@ fn ui_builder() -> impl Widget<Uploader> {
                     drop(tx); // Close the channel
 
                     // Limit the total size of concurrent uploads to manage memory usage
-                    let max_memory_usage: usize = 8 * 1024 * 1024 * 1024; // 8 GB
                     let start_time = std::time::Instant::now();
-                    let semaphore = Arc::new(Semaphore::new(max_memory_usage));
+                    let concurrency = 10;
+                    let semaphore = Arc::new(Semaphore::new(concurrency));
                     let mut upload_futures = vec![];
 
                     for (idx, data, file_size, file_name, blob_name) in rx {
@@ -227,7 +227,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                         let semaphore = semaphore.clone();
                         let ext_event_sink = ext_event_sink.clone();
                         let upload_future = tokio::spawn(async move {
-                            let _permit = semaphore.acquire_many(file_size as u32).await.unwrap();
+                            let _permit = semaphore.acquire().await.unwrap();
                             match blob_client.put_block_blob(data).await {
                                 Ok(_) => {
                                     ext_event_sink
