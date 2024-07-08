@@ -6,10 +6,12 @@ use druid::{
     AppDelegate, AppLauncher, Color, Command, Data, DelegateCtx, Env, Handled, Lens, Selector,
     Target, Widget, WidgetExt, WindowDesc,
 };
-use futures::future::try_join_all;
+use rayon::prelude::*;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, mpsc};
+use tokio::runtime::Runtime;
 
 #[derive(Clone, Lens)]
 struct Uploader {
@@ -98,7 +100,7 @@ fn ui_builder() -> impl Widget<Uploader> {
             data.error.clear(); // Clear previous errors
 
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+                let rt = Runtime::new().expect("Failed to create Tokio runtime");
                 rt.block_on(async move {
                     let storage_credentials =
                         StorageCredentials::access_key(account.clone(), access_key.clone());
@@ -120,9 +122,11 @@ fn ui_builder() -> impl Widget<Uploader> {
                     };
 
                     let total_files = entries.len() as u64;
-                    let mut upload_futures = vec![];
+                    let (tx, rx) = mpsc::channel();
+                    let ext_event_sink = Arc::new(ext_event_sink);
 
-                    for (idx, entry) in entries.into_iter().enumerate() {
+                    // Reading files and preparing data in parallel using Rayon
+                    entries.into_par_iter().enumerate().for_each_with(tx.clone(), |s, (idx, entry)| {
                         let entry = match entry {
                             Ok(entry) => entry,
                             Err(err) => {
@@ -133,7 +137,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                         Target::Auto,
                                     )
                                     .unwrap();
-                                continue;
+                                return;
                             }
                         };
 
@@ -150,7 +154,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                                 Target::Auto,
                                             )
                                             .unwrap();
-                                        continue;
+                                        return;
                                     }
                                 },
                                 None => {
@@ -161,7 +165,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    continue;
+                                    return;
                                 }
                             };
 
@@ -185,7 +189,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    continue;
+                                    return;
                                 }
                             };
 
@@ -198,24 +202,59 @@ fn ui_builder() -> impl Widget<Uploader> {
                                         Target::Auto,
                                     )
                                     .unwrap();
-                                continue;
+                                return;
                             }
 
-                            let blob_client = blob_service_client
-                                .container_client(&container)
-                                .blob_client(&blob_name);
-
-                            let task = blob_client.put_block_blob(data).into_future();
-                            upload_futures.push(task);
-
-                            ext_event_sink
-                                .submit_command(
-                                    UPDATE_PROGRESS,
-                                    ((idx as f64 + 1.0) / total_files as f64) * 100.0,
-                                    Target::Auto,
-                                )
-                                .unwrap();
+                            s.send((idx, data, file_name, blob_name)).unwrap();
                         }
+                    });
+
+                    drop(tx); // Close the channel
+
+                    // Limit the number of concurrent uploads to manage memory usage
+                    let max_concurrent_uploads = 1000;
+                    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_uploads));
+                    let mut upload_futures = vec![];
+
+                    for (idx, data, file_name, blob_name) in rx {
+                        let blob_client = blob_service_client
+                            .container_client(&container)
+                            .blob_client(&blob_name);
+
+                        let semaphore = semaphore.clone();
+                        let ext_event_sink = ext_event_sink.clone();
+                        let upload_future = tokio::spawn(async move {
+                            let _permit = semaphore.acquire().await.unwrap();
+                            match blob_client.put_block_blob(data).await {
+                                Ok(_) => {
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_PROGRESS,
+                                            ((idx as f64 + 1.0) / total_files as f64) * 100.0,
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_INFO,
+                                            format!("Uploaded file: {}", file_name),
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                }
+                                Err(err) => {
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_ERROR,
+                                            format!("Failed to upload file {}: {}", file_name, err),
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                }
+                            }
+                        });
+
+                        upload_futures.push(upload_future);
                     }
 
                     // Allow all blobs to upload.
@@ -228,8 +267,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                             )
                             .unwrap();
                     } else {
-                        // Allow all blobs to upload.
-                        match try_join_all(upload_futures).await {
+                        match futures::future::try_join_all(upload_futures).await {
                             Ok(_) => {
                                 ext_event_sink
                                     .submit_command(UPDATE_PROGRESS, 100.0, Target::Auto)
