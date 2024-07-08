@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::{Arc, mpsc};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Lens)]
 struct Uploader {
@@ -24,7 +23,6 @@ struct Uploader {
     storage_account_key: String,
     info: String,
     error: String,
-    cancel: Arc<AtomicBool>,
 }
 
 const UPDATE_PROGRESS: Selector<f64> = Selector::new("uploader.update-progress");
@@ -58,13 +56,6 @@ fn ui_builder() -> impl Widget<Uploader> {
     let storage_account_key_input = Flex::row()
         .with_child(Label::new("Storage Account Key:"))
         .with_flex_child(TextBox::new().lens(Uploader::storage_account_key), 1.0);
-
-    let cancel_button = Flex::row().with_child(Button::new("Cancel").on_click(
-        move |_ctx, data: &mut Uploader, _env| {
-            data.cancel.store(true, Ordering::Relaxed);
-            std::process::exit(0);
-        },
-    ));
 
     let upload_button = Flex::row().with_child(Button::new("Upload").on_click(
         move |ctx, data: &mut Uploader, _env| {
@@ -224,6 +215,7 @@ fn ui_builder() -> impl Widget<Uploader> {
 
                     // Limit the total size of concurrent uploads to manage memory usage
                     let max_memory_usage: usize = 8 * 1024 * 1024 * 1024; // 8 GB
+                    let start_time = std::time::Instant::now();
                     let semaphore = Arc::new(Semaphore::new(max_memory_usage));
                     let mut upload_futures = vec![];
 
@@ -245,14 +237,18 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    ext_event_sink
-                                        .submit_command(
-                                            UPDATE_INFO,
-                                            format!("Uploaded file: {}", file_name),
-                                            Target::Auto,
-                                        )
-                                        .unwrap();
+                                    // ext_event_sink
+                                    //     .submit_command(
+                                    //         UPDATE_INFO,
+                                    //         format!(
+                                    //             "Uploaded {} ({} bytes) in {:.2?}",
+                                    //             file_name, file_size, duration
+                                    //         ),
+                                    //         Target::Auto,
+                                    //     )
+                                    //     .unwrap();
                                 }
+
                                 Err(err) => {
                                     ext_event_sink
                                         .submit_command(
@@ -267,7 +263,6 @@ fn ui_builder() -> impl Widget<Uploader> {
 
                         upload_futures.push(upload_future);
                     }
-
                     // Allow all blobs to upload.
                     if upload_futures.is_empty() {
                         ext_event_sink
@@ -280,6 +275,9 @@ fn ui_builder() -> impl Widget<Uploader> {
                     } else {
                         match futures::future::try_join_all(upload_futures).await {
                             Ok(_) => {
+                                let end_time = std::time::Instant::now();
+                                let duration = end_time.duration_since(start_time);
+                                ext_event_sink.submit_command(UPDATE_INFO, format!("All files uploaded successfully in {:.2?}", duration), Target::Auto).unwrap();
                                 ext_event_sink
                                     .submit_command(UPDATE_PROGRESS, 100.0, Target::Auto)
                                     .unwrap();
@@ -305,8 +303,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                 });
             });
         },
-    )
-    );
+    ));
 
     Flex::column()
         .with_child(container_input)
@@ -321,11 +318,8 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_spacer(10.0)
         .with_child(upload_button)
         .with_spacer(10.0)
-        .with_child(cancel_button)
-        .with_spacer(10.0)
         .with_child(info_label)
         .with_child(error_label)
-
         .padding(10.0)
 }
 
@@ -347,7 +341,6 @@ fn main() {
         storage_account_key: String::new(),
         info: String::new(),
         error: String::new(),
-        cancel: Arc::new(AtomicBool::new(false)),
     };
 
     AppLauncher::with_window(main_window)
@@ -378,24 +371,12 @@ impl AppDelegate<Uploader> for Delegate {
         data: &mut Uploader,
         _: &Env,
     ) -> Handled {
-        if let Some(progress) = cmd.get(UPDATE_PROGRESS) {
-            data.info.push_str(&format!("\nProgress: {:.2}%", progress));
-            return Handled::Yes;
-        }
         if let Some(error) = cmd.get(UPDATE_ERROR) {
             data.error = error.clone();
             return Handled::Yes;
         }
         if let Some(info) = cmd.get(UPDATE_INFO) {
             data.info.push_str(&format!("\n{}", info));
-            return Handled::Yes;
-        }
-        if let Some(file_name) = cmd.get(UPDATE_FILE_NAME) {
-            data.info.push_str(&format!("\nFile name: {}", file_name));
-            return Handled::Yes;
-        }
-        if let Some(blob_name) = cmd.get(UPDATE_BLOB_NAME) {
-            data.info.push_str(&format!("\nBlob name: {}", blob_name));
             return Handled::Yes;
         }
         Handled::No
