@@ -12,6 +12,8 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Lens)]
 struct Uploader {
@@ -22,6 +24,7 @@ struct Uploader {
     storage_account_key: String,
     info: String,
     error: String,
+    cancel: Arc<AtomicBool>,
 }
 
 const UPDATE_PROGRESS: Selector<f64> = Selector::new("uploader.update-progress");
@@ -55,6 +58,13 @@ fn ui_builder() -> impl Widget<Uploader> {
     let storage_account_key_input = Flex::row()
         .with_child(Label::new("Storage Account Key:"))
         .with_flex_child(TextBox::new().lens(Uploader::storage_account_key), 1.0);
+
+    let cancel_button = Flex::row().with_child(Button::new("Cancel").on_click(
+        move |_ctx, data: &mut Uploader, _env| {
+            data.cancel.store(true, Ordering::Relaxed);
+            std::process::exit(0);
+        },
+    ));
 
     let upload_button = Flex::row().with_child(Button::new("Upload").on_click(
         move |ctx, data: &mut Uploader, _env| {
@@ -205,18 +215,19 @@ fn ui_builder() -> impl Widget<Uploader> {
                                 return;
                             }
 
-                            s.send((idx, data, file_name, blob_name)).unwrap();
+                            let file_size = data.len();
+                            s.send((idx, data, file_size, file_name, blob_name)).unwrap();
                         }
                     });
 
                     drop(tx); // Close the channel
 
-                    // Limit the number of concurrent uploads to manage memory usage
-                    let max_concurrent_uploads = 1000;
-                    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_uploads));
+                    // Limit the total size of concurrent uploads to manage memory usage
+                    let max_memory_usage: usize = 8 * 1024 * 1024 * 1024; // 8 GB
+                    let semaphore = Arc::new(Semaphore::new(max_memory_usage));
                     let mut upload_futures = vec![];
 
-                    for (idx, data, file_name, blob_name) in rx {
+                    for (idx, data, file_size, file_name, blob_name) in rx {
                         let blob_client = blob_service_client
                             .container_client(&container)
                             .blob_client(&blob_name);
@@ -224,7 +235,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                         let semaphore = semaphore.clone();
                         let ext_event_sink = ext_event_sink.clone();
                         let upload_future = tokio::spawn(async move {
-                            let _permit = semaphore.acquire().await.unwrap();
+                            let _permit = semaphore.acquire_many(file_size as u32).await.unwrap();
                             match blob_client.put_block_blob(data).await {
                                 Ok(_) => {
                                     ext_event_sink
@@ -294,7 +305,8 @@ fn ui_builder() -> impl Widget<Uploader> {
                 });
             });
         },
-    ));
+    )
+    );
 
     Flex::column()
         .with_child(container_input)
@@ -309,8 +321,11 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_spacer(10.0)
         .with_child(upload_button)
         .with_spacer(10.0)
+        .with_child(cancel_button)
+        .with_spacer(10.0)
         .with_child(info_label)
         .with_child(error_label)
+
         .padding(10.0)
 }
 
@@ -332,6 +347,7 @@ fn main() {
         storage_account_key: String::new(),
         info: String::new(),
         error: String::new(),
+        cancel: Arc::new(AtomicBool::new(false)),
     };
 
     AppLauncher::with_window(main_window)
