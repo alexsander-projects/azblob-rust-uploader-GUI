@@ -20,6 +20,7 @@ tokio = { version = "1.38.0", features = ["full"] }
 druid = "0.8.3"
 indicatif = "0.17.8"
 winapi = "0.3"
+rayon = "1.10.0"
 
 [[bin]]
 name = "azure-storage-uploader"

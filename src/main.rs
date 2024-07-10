@@ -6,10 +6,15 @@ use druid::{
     AppDelegate, AppLauncher, Color, Command, Data, DelegateCtx, Env, Handled, Lens, Selector,
     Target, Widget, WidgetExt, WindowDesc,
 };
-use futures::future::try_join_all;
+use rayon::prelude::*;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use std::sync::Mutex;
+use druid::widget::Checkbox;
 
 #[derive(Clone, Lens)]
 struct Uploader {
@@ -20,6 +25,8 @@ struct Uploader {
     storage_account_key: String,
     info: String,
     error: String,
+    is_cancelling: Arc<AtomicBool>,
+    recursive_upload: bool,
 }
 
 const UPDATE_PROGRESS: Selector<f64> = Selector::new("uploader.update-progress");
@@ -27,6 +34,7 @@ const UPDATE_ERROR: Selector<String> = Selector::new("uploader.update-error");
 const UPDATE_INFO: Selector<String> = Selector::new("uploader.update-info");
 const UPDATE_FILE_NAME: Selector<String> = Selector::new("uploader.update-file-name");
 const UPDATE_BLOB_NAME: Selector<String> = Selector::new("uploader.update-blob-name");
+const CANCEL_UPLOAD: Selector = Selector::new("uploader.cancel-upload");
 
 fn ui_builder() -> impl Widget<Uploader> {
     let info_label = Label::new(|data: &Uploader, _env: &Env| format!("{}", data.info));
@@ -54,6 +62,10 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_child(Label::new("Storage Account Key:"))
         .with_flex_child(TextBox::new().lens(Uploader::storage_account_key), 1.0);
 
+    let recursive_upload_checkbox = Flex::row()
+        .with_child(Label::new("Recursive Upload(if checked, will also upload nested folders):"))
+        .with_flex_child(Checkbox::new("").lens(Uploader::recursive_upload), 1.0);
+
     let upload_button = Flex::row().with_child(Button::new("Upload").on_click(
         move |ctx, data: &mut Uploader, _env| {
             let container = data.container.clone();
@@ -62,6 +74,8 @@ fn ui_builder() -> impl Widget<Uploader> {
             let account = data.storage_account.clone();
             let access_key = data.storage_account_key.clone();
             let ext_event_sink = ctx.get_external_handle();
+            let is_cancelling = data.is_cancelling.clone();
+            let recursive_upload = data.recursive_upload;
 
             // Check if all necessary inputs are provided
             if container.is_empty() {
@@ -96,48 +110,29 @@ fn ui_builder() -> impl Widget<Uploader> {
                 folder_path, account, upload_folder, container
             );
             data.error.clear(); // Clear previous errors
+            is_cancelling.store(false, Ordering::SeqCst); // Reset cancel flag
 
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+                let rt = Runtime::new().expect("Failed to create Tokio runtime");
                 rt.block_on(async move {
                     let storage_credentials =
                         StorageCredentials::access_key(account.clone(), access_key.clone());
                     let blob_service_client =
                         BlobServiceClient::new(account.clone(), storage_credentials);
 
-                    let entries: Vec<_> = match fs::read_dir(Path::new(&folder_path)) {
-                        Ok(entries) => entries.collect(),
-                        Err(err) => {
-                            ext_event_sink
-                                .submit_command(
-                                    UPDATE_ERROR,
-                                    format!("Directory read error: {}", err),
-                                    Target::Auto,
-                                )
-                                .unwrap();
-                            return;
-                        }
+                    // Adjusted logic to use cloned data
+                    let entries = if recursive_upload {
+                        collect_files_recursively(&folder_path).unwrap_or_else(|_| Vec::new())
+                    } else {
+                        collect_files_non_recursively(&folder_path).unwrap_or_else(|_| Vec::new())
                     };
 
                     let total_files = entries.len() as u64;
-                    let mut upload_futures = vec![];
+                    let (tx, rx) = mpsc::channel();
+                    let ext_event_sink = Arc::new(ext_event_sink);
 
-                    for (idx, entry) in entries.into_iter().enumerate() {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(err) => {
-                                ext_event_sink
-                                    .submit_command(
-                                        UPDATE_ERROR,
-                                        format!("Failed to read entry: {}", err),
-                                        Target::Auto,
-                                    )
-                                    .unwrap();
-                                continue;
-                            }
-                        };
-
-                        let path = entry.path();
+                    // Reading files and preparing data in parallel using Rayon
+                    entries.into_par_iter().enumerate().for_each_with(tx.clone(), |s, (idx, path)| {
                         if path.is_file() {
                             let file_name = match path.file_name() {
                                 Some(name) => match name.to_str() {
@@ -150,7 +145,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                                 Target::Auto,
                                             )
                                             .unwrap();
-                                        continue;
+                                        return;
                                     }
                                 },
                                 None => {
@@ -161,11 +156,12 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    continue;
+                                    return;
                                 }
                             };
 
-                            let blob_name = format!("{}/{}", upload_folder, file_name);
+                            let relative_path = path.strip_prefix(&folder_path).unwrap();
+                            let blob_name = format!("{}/{}", upload_folder, relative_path.display());
 
                             ext_event_sink
                                 .submit_command(UPDATE_FILE_NAME, file_name.clone(), Target::Auto)
@@ -185,7 +181,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    continue;
+                                    return;
                                 }
                             };
 
@@ -198,26 +194,80 @@ fn ui_builder() -> impl Widget<Uploader> {
                                         Target::Auto,
                                     )
                                     .unwrap();
-                                continue;
+                                return;
                             }
 
-                            let blob_client = blob_service_client
-                                .container_client(&container)
-                                .blob_client(&blob_name);
+                            let file_size = data.len();
+                            s.send((idx, data, file_size, file_name, blob_name)).unwrap();
+                        }
+                    });
 
-                            let task = blob_client.put_block_blob(data).into_future();
-                            upload_futures.push(task);
+                    drop(tx); // Close the channel
 
+                    // Limit the total size of concurrent uploads to manage memory usage
+                    let start_time = std::time::Instant::now();
+                    let concurrency = 10;
+                    let semaphore = Arc::new(Semaphore::new(concurrency));
+                    let mut upload_futures = vec![];
+
+                    for (idx, data, _file_size, file_name, blob_name) in rx {
+                        if is_cancelling.load(Ordering::SeqCst) {
                             ext_event_sink
                                 .submit_command(
-                                    UPDATE_PROGRESS,
-                                    ((idx as f64 + 1.0) / total_files as f64) * 100.0,
+                                    UPDATE_INFO,
+                                    "Upload cancelled by user.".to_string(),
                                     Target::Auto,
                                 )
                                 .unwrap();
+                            break;
                         }
-                    }
 
+                        let blob_client = blob_service_client
+                            .container_client(&container)
+                            .blob_client(&blob_name);
+
+                        let semaphore = semaphore.clone();
+                        let ext_event_sink = ext_event_sink.clone();
+                        let is_cancelling = is_cancelling.clone();
+                        let upload_future = tokio::spawn(async move {
+                            let _permit = semaphore.acquire().await.unwrap();
+
+                            if is_cancelling.load(Ordering::SeqCst) {
+                                ext_event_sink
+                                    .submit_command(
+                                        UPDATE_INFO,
+                                        "Upload cancelled by user.".to_string(),
+                                        Target::Auto,
+                                    )
+                                    .unwrap();
+                                return;
+                            }
+
+                            match blob_client.put_block_blob(data).await {
+                                Ok(_) => {
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_PROGRESS,
+                                            ((idx as f64 + 1.0) / total_files as f64) * 100.0,
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                }
+
+                                Err(err) => {
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_ERROR,
+                                            format!("Failed to upload file {}: {}", file_name, err),
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                }
+                            }
+                        });
+
+                        upload_futures.push(upload_future);
+                    }
                     // Allow all blobs to upload.
                     if upload_futures.is_empty() {
                         ext_event_sink
@@ -228,19 +278,31 @@ fn ui_builder() -> impl Widget<Uploader> {
                             )
                             .unwrap();
                     } else {
-                        // Allow all blobs to upload.
-                        match try_join_all(upload_futures).await {
+                        match futures::future::try_join_all(upload_futures).await {
                             Ok(_) => {
-                                ext_event_sink
-                                    .submit_command(UPDATE_PROGRESS, 100.0, Target::Auto)
-                                    .unwrap();
-                                ext_event_sink
-                                    .submit_command(
-                                        UPDATE_INFO,
-                                        "All files uploaded successfully!".to_string(),
-                                        Target::Auto,
-                                    )
-                                    .unwrap();
+                                if is_cancelling.load(Ordering::SeqCst) {
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_INFO,
+                                            "Upload cancelled by user.".to_string(),
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                } else {
+                                    let end_time = std::time::Instant::now();
+                                    let duration = end_time.duration_since(start_time);
+                                    ext_event_sink.submit_command(UPDATE_INFO, format!("All files uploaded successfully in {:.2?}", duration), Target::Auto).unwrap();
+                                    ext_event_sink
+                                        .submit_command(UPDATE_PROGRESS, 100.0, Target::Auto)
+                                        .unwrap();
+                                    ext_event_sink
+                                        .submit_command(
+                                            UPDATE_INFO,
+                                            "All files uploaded successfully!".to_string(),
+                                            Target::Auto,
+                                        )
+                                        .unwrap();
+                                }
                             }
                             Err(err) => {
                                 ext_event_sink
@@ -258,6 +320,14 @@ fn ui_builder() -> impl Widget<Uploader> {
         },
     ));
 
+    let cancel_button = Flex::row().with_child(Button::new("Cancel").on_click(
+        move |ctx, data: &mut Uploader, _env| {
+            data.is_cancelling.store(true, Ordering::SeqCst);
+            ctx.submit_command(CANCEL_UPLOAD);
+        },
+    ));
+    let buttons_row = Flex::row().with_child(upload_button).with_child(cancel_button);
+
     Flex::column()
         .with_child(container_input)
         .with_spacer(10.0)
@@ -269,11 +339,48 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_spacer(10.0)
         .with_child(storage_account_key_input)
         .with_spacer(10.0)
-        .with_child(upload_button)
+        .with_child(recursive_upload_checkbox)
+        .with_child(buttons_row)
         .with_spacer(10.0)
         .with_child(info_label)
         .with_child(error_label)
         .padding(10.0)
+}
+
+fn collect_files_recursively(path: &str) -> Result<Vec<PathBuf>, std::io::Error> {
+    let root_path = Path::new(path);
+    let entries: Vec<Result<_, _>> = fs::read_dir(root_path)?
+        .collect();
+    let files = Mutex::new(Vec::new());
+
+    entries.into_par_iter().for_each(|entry| {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            let mut files_guard = files.lock().unwrap();
+            files_guard.extend(collect_files_recursively(path.to_str().unwrap()).unwrap());
+        } else {
+            let mut files_guard = files.lock().unwrap();
+            files_guard.push(path);
+        }
+    });
+
+    Ok(files.into_inner().unwrap())
+}
+
+fn collect_files_non_recursively(path: &str) -> Result<Vec<PathBuf>, std::io::Error> {
+    let root_path = Path::new(path);
+    let mut files = Vec::new();
+
+    for entry in fs::read_dir(root_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(files)
 }
 
 fn main() {
@@ -294,6 +401,8 @@ fn main() {
         storage_account_key: String::new(),
         info: String::new(),
         error: String::new(),
+        is_cancelling: Arc::new(AtomicBool::new(false)),
+        recursive_upload: false,
     };
 
     AppLauncher::with_window(main_window)
@@ -324,24 +433,12 @@ impl AppDelegate<Uploader> for Delegate {
         data: &mut Uploader,
         _: &Env,
     ) -> Handled {
-        if let Some(progress) = cmd.get(UPDATE_PROGRESS) {
-            data.info.push_str(&format!("\nProgress: {:.2}%", progress));
-            return Handled::Yes;
-        }
         if let Some(error) = cmd.get(UPDATE_ERROR) {
             data.error = error.clone();
             return Handled::Yes;
         }
         if let Some(info) = cmd.get(UPDATE_INFO) {
             data.info.push_str(&format!("\n{}", info));
-            return Handled::Yes;
-        }
-        if let Some(file_name) = cmd.get(UPDATE_FILE_NAME) {
-            data.info.push_str(&format!("\nFile name: {}", file_name));
-            return Handled::Yes;
-        }
-        if let Some(blob_name) = cmd.get(UPDATE_BLOB_NAME) {
-            data.info.push_str(&format!("\nBlob name: {}", blob_name));
             return Handled::Yes;
         }
         Handled::No
@@ -357,5 +454,6 @@ impl Data for Uploader {
             && self.storage_account_key == other.storage_account_key
             && self.error == other.error
             && self.info == other.info
+            && Arc::ptr_eq(&self.is_cancelling, &other.is_cancelling)
     }
 }
