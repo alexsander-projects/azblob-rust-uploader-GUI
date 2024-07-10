@@ -9,10 +9,11 @@ use druid::{
 use rayon::prelude::*;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
+use std::sync::Mutex;
 
 #[derive(Clone, Lens)]
 struct Uploader {
@@ -112,8 +113,9 @@ fn ui_builder() -> impl Widget<Uploader> {
                     let blob_service_client =
                         BlobServiceClient::new(account.clone(), storage_credentials);
 
-                    let entries: Vec<_> = match fs::read_dir(Path::new(&folder_path)) {
-                        Ok(entries) => entries.collect(),
+                    // Collect all file paths recursively using Rayon for parallelism
+                    let entries = match collect_files_recursively(&folder_path) {
+                        Ok(entries) => entries,
                         Err(err) => {
                             ext_event_sink
                                 .submit_command(
@@ -131,22 +133,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                     let ext_event_sink = Arc::new(ext_event_sink);
 
                     // Reading files and preparing data in parallel using Rayon
-                    entries.into_par_iter().enumerate().for_each_with(tx.clone(), |s, (idx, entry)| {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(err) => {
-                                ext_event_sink
-                                    .submit_command(
-                                        UPDATE_ERROR,
-                                        format!("Failed to read entry: {}", err),
-                                        Target::Auto,
-                                    )
-                                    .unwrap();
-                                return;
-                            }
-                        };
-
-                        let path = entry.path();
+                    entries.into_par_iter().enumerate().for_each_with(tx.clone(), |s, (idx, path)| {
                         if path.is_file() {
                             let file_name = match path.file_name() {
                                 Some(name) => match name.to_str() {
@@ -174,7 +161,8 @@ fn ui_builder() -> impl Widget<Uploader> {
                                 }
                             };
 
-                            let blob_name = format!("{}/{}", upload_folder, file_name);
+                            let relative_path = path.strip_prefix(&folder_path).unwrap();
+                            let blob_name = format!("{}/{}", upload_folder, relative_path.display());
 
                             ext_event_sink
                                 .submit_command(UPDATE_FILE_NAME, file_name.clone(), Target::Auto)
@@ -357,6 +345,27 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_child(info_label)
         .with_child(error_label)
         .padding(10.0)
+}
+
+fn collect_files_recursively(path: &str) -> Result<Vec<PathBuf>, std::io::Error> {
+    let root_path = Path::new(path);
+    let entries: Vec<Result<_, _>> = fs::read_dir(root_path)?
+        .collect();
+    let files = Mutex::new(Vec::new());
+
+    entries.into_par_iter().for_each(|entry| {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            let mut files_guard = files.lock().unwrap();
+            files_guard.extend(collect_files_recursively(path.to_str().unwrap()).unwrap());
+        } else {
+            let mut files_guard = files.lock().unwrap();
+            files_guard.push(path);
+        }
+    });
+
+    Ok(files.into_inner().unwrap())
 }
 
 fn main() {
