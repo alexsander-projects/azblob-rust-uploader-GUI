@@ -14,6 +14,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use std::sync::Mutex;
+use druid::widget::Checkbox;
 
 #[derive(Clone, Lens)]
 struct Uploader {
@@ -25,6 +26,7 @@ struct Uploader {
     info: String,
     error: String,
     is_cancelling: Arc<AtomicBool>,
+    recursive_upload: bool,
 }
 
 const UPDATE_PROGRESS: Selector<f64> = Selector::new("uploader.update-progress");
@@ -60,6 +62,10 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_child(Label::new("Storage Account Key:"))
         .with_flex_child(TextBox::new().lens(Uploader::storage_account_key), 1.0);
 
+    let recursive_upload_checkbox = Flex::row()
+        .with_child(Label::new("Recursive Upload:"))
+        .with_flex_child(Checkbox::new("").lens(Uploader::recursive_upload), 1.0);
+
     let upload_button = Flex::row().with_child(Button::new("Upload").on_click(
         move |ctx, data: &mut Uploader, _env| {
             let container = data.container.clone();
@@ -69,6 +75,7 @@ fn ui_builder() -> impl Widget<Uploader> {
             let access_key = data.storage_account_key.clone();
             let ext_event_sink = ctx.get_external_handle();
             let is_cancelling = data.is_cancelling.clone();
+            let recursive_upload = data.recursive_upload;
 
             // Check if all necessary inputs are provided
             if container.is_empty() {
@@ -113,19 +120,11 @@ fn ui_builder() -> impl Widget<Uploader> {
                     let blob_service_client =
                         BlobServiceClient::new(account.clone(), storage_credentials);
 
-                    // Collect all file paths recursively using Rayon for parallelism
-                    let entries = match collect_files_recursively(&folder_path) {
-                        Ok(entries) => entries,
-                        Err(err) => {
-                            ext_event_sink
-                                .submit_command(
-                                    UPDATE_ERROR,
-                                    format!("Directory read error: {}", err),
-                                    Target::Auto,
-                                )
-                                .unwrap();
-                            return;
-                        }
+                    // Adjusted logic to use cloned data
+                    let entries = if recursive_upload {
+                        collect_files_recursively(&folder_path).unwrap_or_else(|_| Vec::new())
+                    } else {
+                        collect_files_non_recursively(&folder_path).unwrap_or_else(|_| Vec::new())
                     };
 
                     let total_files = entries.len() as u64;
@@ -342,6 +341,7 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_spacer(10.0)
         .with_child(buttons_row)
         .with_spacer(10.0)
+        .with_child(recursive_upload_checkbox)
         .with_child(info_label)
         .with_child(error_label)
         .padding(10.0)
@@ -368,6 +368,21 @@ fn collect_files_recursively(path: &str) -> Result<Vec<PathBuf>, std::io::Error>
     Ok(files.into_inner().unwrap())
 }
 
+fn collect_files_non_recursively(path: &str) -> Result<Vec<PathBuf>, std::io::Error> {
+    let root_path = Path::new(path);
+    let mut files = Vec::new();
+
+    for entry in fs::read_dir(root_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(files)
+}
+
 fn main() {
     #[cfg(target_os = "windows")]
     {
@@ -387,6 +402,7 @@ fn main() {
         info: String::new(),
         error: String::new(),
         is_cancelling: Arc::new(AtomicBool::new(false)),
+        recursive_upload: false,
     };
 
     AppLauncher::with_window(main_window)
