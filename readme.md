@@ -14,6 +14,10 @@ Files are loaded using rayon, a data parallelism library for Rust.
 Then, the files are uploaded to Azure Storage Blob using the Azure SDK for Rust. The application uses the tokio runtime
 to upload files concurrently, which makes the upload process faster.
 
+The app is capable of uploading multiple files recursively or not(if recursive upload is enabled, nested folders
+will also be uploaded),
+depending on the user's choice.
+
 ### How to use
 
 1. Pass in your Container name, Folder path, Upload Folder, Storage Account name, and Storage Account key in the respective fields.
