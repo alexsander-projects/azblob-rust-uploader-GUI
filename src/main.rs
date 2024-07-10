@@ -63,7 +63,7 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_flex_child(TextBox::new().lens(Uploader::storage_account_key), 1.0);
 
     let recursive_upload_checkbox = Flex::row()
-        .with_child(Label::new("Recursive Upload:"))
+        .with_child(Label::new("Recursive Upload(if checked, will also upload nested folders):"))
         .with_flex_child(Checkbox::new("").lens(Uploader::recursive_upload), 1.0);
 
     let upload_button = Flex::row().with_child(Button::new("Upload").on_click(
@@ -339,9 +339,9 @@ fn ui_builder() -> impl Widget<Uploader> {
         .with_spacer(10.0)
         .with_child(storage_account_key_input)
         .with_spacer(10.0)
+        .with_child(recursive_upload_checkbox)
         .with_child(buttons_row)
         .with_spacer(10.0)
-        .with_child(recursive_upload_checkbox)
         .with_child(info_label)
         .with_child(error_label)
         .padding(10.0)
