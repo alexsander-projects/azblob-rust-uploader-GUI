@@ -8,6 +8,7 @@ use druid::{
 };
 use rayon::prelude::*;
 use std::fs;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
@@ -113,6 +114,7 @@ fn ui_builder() -> impl Widget<Uploader> {
             is_cancelling.store(false, Ordering::SeqCst); // Reset cancel flag
 
             std::thread::spawn(move || {
+                let start_time = std::time::Instant::now();
                 let rt = Runtime::new().expect("Failed to create Tokio runtime");
                 rt.block_on(async move {
                     let storage_credentials =
@@ -128,11 +130,21 @@ fn ui_builder() -> impl Widget<Uploader> {
                     };
 
                     let total_files = entries.len() as u64;
-                    let (tx, rx) = mpsc::channel();
                     let ext_event_sink = Arc::new(ext_event_sink);
 
-                    // Reading files and preparing data in parallel using Rayon
-                    entries.into_par_iter().enumerate().for_each_with(tx.clone(), |s, (idx, path)| {
+                    // Process and upload each file individually
+                    for (idx, path) in entries.into_iter().enumerate() {
+                        if is_cancelling.load(Ordering::SeqCst) {
+                            ext_event_sink
+                                .submit_command(
+                                    UPDATE_INFO,
+                                    "Upload cancelled by user.".to_string(),
+                                    Target::Auto,
+                                )
+                                .unwrap();
+                            break;
+                        }
+
                         if path.is_file() {
                             let file_name = match path.file_name() {
                                 Some(name) => match name.to_str() {
@@ -145,7 +157,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                                 Target::Auto,
                                             )
                                             .unwrap();
-                                        return;
+                                        continue;
                                     }
                                 },
                                 None => {
@@ -156,7 +168,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    return;
+                                    continue;
                                 }
                             };
 
@@ -171,7 +183,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                 .submit_command(UPDATE_BLOB_NAME, blob_name.clone(), Target::Auto)
                                 .unwrap();
 
-                            let mut file = match fs::File::open(&path) {
+                            let mut file = match File::open(&path) {
                                 Ok(file) => file,
                                 Err(err) => {
                                     ext_event_sink
@@ -181,7 +193,7 @@ fn ui_builder() -> impl Widget<Uploader> {
                                             Target::Auto,
                                         )
                                         .unwrap();
-                                    return;
+                                    continue;
                                 }
                             };
 
@@ -194,54 +206,12 @@ fn ui_builder() -> impl Widget<Uploader> {
                                         Target::Auto,
                                     )
                                     .unwrap();
-                                return;
+                                continue;
                             }
 
-                            let file_size = data.len();
-                            s.send((idx, data, file_size, file_name, blob_name)).unwrap();
-                        }
-                    });
-
-                    drop(tx); // Close the channel
-
-                    // Limit the total size of concurrent uploads to manage memory usage
-                    let start_time = std::time::Instant::now();
-                    let concurrency = 10;
-                    let semaphore = Arc::new(Semaphore::new(concurrency));
-                    let mut upload_futures = vec![];
-
-                    for (idx, data, _file_size, file_name, blob_name) in rx {
-                        if is_cancelling.load(Ordering::SeqCst) {
-                            ext_event_sink
-                                .submit_command(
-                                    UPDATE_INFO,
-                                    "Upload cancelled by user.".to_string(),
-                                    Target::Auto,
-                                )
-                                .unwrap();
-                            break;
-                        }
-
-                        let blob_client = blob_service_client
-                            .container_client(&container)
-                            .blob_client(&blob_name);
-
-                        let semaphore = semaphore.clone();
-                        let ext_event_sink = ext_event_sink.clone();
-                        let is_cancelling = is_cancelling.clone();
-                        let upload_future = tokio::spawn(async move {
-                            let _permit = semaphore.acquire().await.unwrap();
-
-                            if is_cancelling.load(Ordering::SeqCst) {
-                                ext_event_sink
-                                    .submit_command(
-                                        UPDATE_INFO,
-                                        "Upload cancelled by user.".to_string(),
-                                        Target::Auto,
-                                    )
-                                    .unwrap();
-                                return;
-                            }
+                            let blob_client = blob_service_client
+                                .container_client(&container)
+                                .blob_client(&blob_name);
 
                             match blob_client.put_block_blob(data).await {
                                 Ok(_) => {
@@ -264,61 +234,19 @@ fn ui_builder() -> impl Widget<Uploader> {
                                         .unwrap();
                                 }
                             }
-                        });
-
-                        upload_futures.push(upload_future);
-                    }
-                    // Allow all blobs to upload.
-                    if upload_futures.is_empty() {
-                        ext_event_sink
-                            .submit_command(
-                                UPDATE_INFO,
-                                "No files to upload.".to_string(),
-                                Target::Auto,
-                            )
-                            .unwrap();
-                    } else {
-                        match futures::future::try_join_all(upload_futures).await {
-                            Ok(_) => {
-                                if is_cancelling.load(Ordering::SeqCst) {
-                                    ext_event_sink
-                                        .submit_command(
-                                            UPDATE_INFO,
-                                            "Upload cancelled by user.".to_string(),
-                                            Target::Auto,
-                                        )
-                                        .unwrap();
-                                } else {
-                                    let end_time = std::time::Instant::now();
-                                    let duration = end_time.duration_since(start_time);
-                                    ext_event_sink.submit_command(UPDATE_INFO, format!("All files uploaded successfully in {:.2?}", duration), Target::Auto).unwrap();
-                                    ext_event_sink
-                                        .submit_command(UPDATE_PROGRESS, 100.0, Target::Auto)
-                                        .unwrap();
-                                    ext_event_sink
-                                        .submit_command(
-                                            UPDATE_INFO,
-                                            "All files uploaded successfully!".to_string(),
-                                            Target::Auto,
-                                        )
-                                        .unwrap();
-                                }
-                            }
-                            Err(err) => {
-                                ext_event_sink
-                                    .submit_command(
-                                        UPDATE_ERROR,
-                                        format!("Failed to upload files: {:?}", err),
-                                        Target::Auto,
-                                    )
-                                    .unwrap();
-                            }
                         }
                     }
+
+                    let end_time = std::time::Instant::now();
+                    let duration = end_time.duration_since(start_time);
+                    ext_event_sink
+                        .submit_command(UPDATE_INFO, format!("All files uploaded successfully in {:.2?}", duration), Target::Auto)
+                        .unwrap();
                 });
             });
         },
     ));
+
 
     let cancel_button = Flex::row().with_child(Button::new("Cancel").on_click(
         move |ctx, data: &mut Uploader, _env| {

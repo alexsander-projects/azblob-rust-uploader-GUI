@@ -14,6 +14,10 @@ Files are loaded using rayon, a data parallelism library for Rust.
 Then, the files are uploaded to Azure Storage Blob using the Azure SDK for Rust. The application uses the tokio runtime
 to upload files concurrently, which makes the upload process faster.
 
+Note that there is a difference between concurrency and parallelism. Concurrency is about dealing with many things at once,
+while parallelism is about using multiple threads to execute tasks simultaneously. In this case, the application uses
+rayon to load files in parallel and tokio to upload files concurrently.
+
 The app is capable of uploading multiple files recursively or not(if recursive upload is enabled, nested folders
 will also be uploaded),
 depending on the user's choice.
@@ -47,3 +51,5 @@ If unchecked, only the files in the selected folder will be uploaded.
 
 The app takes 1 second to upload some test files to azure, these are image files of different sizes being organized in the following schema:
 26 images in the parent folder, 26 images in a subfolder, and 7 image in another subfolder, totaling 59 images and 60MB of data.
+
+Applied changes to the code to make it more efficient, and lightweight, without compromising the performance.
